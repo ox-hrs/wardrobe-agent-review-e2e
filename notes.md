@@ -1,3 +1,8 @@
-# Notes
+# Two-player mode (fixture)
 
-See [draft](docs/draft.md) for the test fixture.
+Track design for the sandbox review run. See [the design](./docs/design.md) for
+tradeoffs, and [walking skeleton](walking.md).
+
+| Field | Type | Notes |
+|---|---|---|
+| rounds | int | fixed |

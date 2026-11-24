@@ -1,0 +1,111 @@
+# E2E fixture: seeds the planner-generated plan and runs the real post job.
+name: E2E post fixture
+'on':
+  workflow_dispatch:
+    inputs: {}
+permissions: {}
+jobs:
+  seed:
+    name: Seed fixture review plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+    - name: Write planner-generated plan
+      env:
+        PLAN_B64: ewogICJhY3Rpb24iOiAiY2xlYW5faGFuZG9mZiIsCiAgInJlYXNvbiI6ICJDTEVBTl9IQU5ET0ZGX1RPX01BSU5UQUlORVJTIiwKICAicHJfbnVtYmVyIjogMSwKICAiaGVhZF9zaGEiOiAiZDM5MzU0NmMzZWE4ZDAxZTJkNTA3NzYxYTk0M2E3MDI2ZTJkOWQzNiIsCiAgImFkZF9sYWJlbHMiOiBbCiAgICAidHJpYWdlOiBwYXNzZWQiCiAgXSwKICAicmVtb3ZlX2xhYmVscyI6IFtdLAogICJ0ZWFtX3Jldmlld2VycyI6IFtdLAogICJyZXZpZXdfcGF5bG9hZCI6IHsKICAgICJldmVudCI6ICJDT01NRU5UIiwKICAgICJib2R5IjogIjwhLS0gZWdtLXRyaWFnZS1yZXZpZXc6c2hhPWQzOTM1NDZjM2VhOGQwMWUyZDUwNzc2MWE5NDNhNzAyNmUyZDlkMzYgLS0+XG5BdXRvbWF0ZWQgZmlyc3QtcGFzcyByZXZpZXcgZm91bmQgemVybyBibG9ja2luZyBvciBtYWpvciBpc3N1ZXMuIiwKICAgICJjb21tZW50cyI6IFtdLAogICAgImNvbW1pdF9pZCI6ICJkMzkzNTQ2YzNlYThkMDFlMmQ1MDc3NjFhOTQzYTcwMjZlMmQ5ZDM2IgogIH0sCiAgImRlcHRoIjogImxpdGUiLAogICJtb2RlbCI6ICJzdHViLXR3by1wYXNzIiwKICAiZm9yY2VfbWFudWFsIjogZmFsc2UKfQ==
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/plan"
+        printf '%s' "$PLAN_B64" | base64 -d > "$RUNNER_TEMP/plan/review-plan.json"
+    - name: "Upload review plan artifact"
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: review-plan
+        path: ${{ runner.temp }}/plan/review-plan.json
+        if-no-files-found: error
+        retention-days: 1
+  post:
+    name: Post Review and Route Maintainers
+    needs: seed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+    - name: Download review plan artifact
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        name: review-plan
+        path: ${{ runner.temp }}/plan
+    - name: Apply review, labels, and maintainer handoff
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+      env:
+        PLAN_PATH: ${{ runner.temp }}/plan/review-plan.json
+        ALLOWED_TEAM: ${{ vars.EGM_MAINTAINERS_TEAM }}
+        FALLBACK_TOKEN: ${{ github.token }}
+      with:
+        github-token: ${{ secrets.EGM_TRIAGE_BOT_TOKEN || github.token }}
+        script: "const fs = require(\"node:fs\");\nconst plan = JSON.parse(fs.readFileSync(process.env.PLAN_PATH,\
+          \ \"utf8\"));\nif (![\"clean_handoff\", \"post_findings\"].includes(plan.action))\
+          \ {\n  core.info(`No action required for plan action=${plan.action}`);\n\
+          \  return;\n}\n\nconst { owner, repo } = context.repo;\nconst prNumber =\
+          \ Number(plan.pr_number);\nif (!Number.isInteger(prNumber) || prNumber <=\
+          \ 0) {\n  core.setFailed(`Invalid PR number in review plan: ${plan.pr_number}`);\n\
+          \  return;\n}\n\nlet client = github;\nlet pr;\ntry {\n  ({ data: pr } =\
+          \ await client.rest.pulls.get({\n    owner,\n    repo,\n    pull_number:\
+          \ prNumber\n  }));\n} catch (error) {\n  if (error.status === 401 && process.env.FALLBACK_TOKEN\
+          \ && typeof getOctokit === \"function\") {\n    core.warning(\n      \"\
+          EGM_TRIAGE_BOT_TOKEN returned HTTP 401 (expired or revoked); falling back\
+          \ to GITHUB_TOKEN.\"\n    );\n    client = getOctokit(process.env.FALLBACK_TOKEN);\n\
+          \    ({ data: pr } = await client.rest.pulls.get({\n      owner,\n     \
+          \ repo,\n      pull_number: prNumber\n    }));\n  } else {\n    throw error;\n\
+          \  }\n}\nif (pr.state !== \"open\") {\n  core.info(`Skipping PR #${prNumber}:\
+          \ state is ${pr.state}`);\n  return;\n}\nif (plan.head_sha && pr.head.sha\
+          \ !== plan.head_sha) {\n  core.info(`Skipping stale plan for ${plan.head_sha};\
+          \ PR head is now ${pr.head.sha}`);\n  return;\n}\nif (!plan.force_manual\
+          \ && /^[0-9a-f]{7,40}$/i.test(String(plan.head_sha || \"\")) && typeof client.rest.pulls.listReviews\
+          \ === \"function\") {\n  const existingReviews = typeof client.paginate\
+          \ === \"function\"\n    ? await client.paginate(client.rest.pulls.listReviews,\
+          \ { owner, repo, pull_number: prNumber, per_page: 100 })\n    : (await client.rest.pulls.listReviews({\
+          \ owner, repo, pull_number: prNumber, per_page: 100 })).data;\n  const shaMarkerRe\
+          \ = new RegExp(`<!--\\\\s*(?:egm-triage-review|egm-triage-bot):sha=${plan.head_sha}\\\
+          \\s*-->`);\n  if (existingReviews.some(r => shaMarkerRe.test(String(r.body\
+          \ || \"\")))) {\n    core.info(`Skipping duplicate post for ${plan.head_sha}:\
+          \ SHA review marker already present.`);\n    return;\n  }\n}\n\nconst formatFallbackBullet\
+          \ = comment => {\n  const normalized = String(comment.body || \"\")\n  \
+          \  .replace(/```suggestion\\b/g, \"```\")\n    .split(\"\\n\")\n    .map((line,\
+          \ idx) => (idx === 0 ? line : `  ${line}`))\n    .join(\"\\n\");\n  const\
+          \ anchor = comment.line ? `${comment.path}:${comment.line}` : comment.path;\n\
+          \  return `- \\`${anchor}\\` ${normalized}`;\n};\n\nconst payload = plan.review_payload\
+          \ || {};\nif (payload.body) {\n  const reviewRequest = {\n    owner,\n \
+          \   repo,\n    pull_number: prNumber,\n    commit_id: payload.commit_id\
+          \ || pr.head.sha,\n    event: \"COMMENT\",\n    body: payload.body,\n  \
+          \  comments: Array.isArray(payload.comments) ? payload.comments : []\n \
+          \ };\n  try {\n    await client.rest.pulls.createReview(reviewRequest);\n\
+          \  } catch (error) {\n    if (error.status === 422 && reviewRequest.comments.length\
+          \ > 0) {\n      core.warning(`Inline review anchors rejected (422); retrying\
+          \ as summary comment: ${error.message}`);\n      const fallbackLines = reviewRequest.comments.map(formatFallbackBullet);\n\
+          \      await client.rest.pulls.createReview({\n        ...reviewRequest,\n\
+          \        body: `${reviewRequest.body}\\n${fallbackLines.join(\"\\n\")}`,\n\
+          \        comments: []\n      });\n    } else {\n      throw error;\n   \
+          \ }\n  }\n}\n\nconst allowedLabels = new Set([\"triage: passed\"]);\nconst\
+          \ addLabels = (plan.add_labels || []).filter(label => allowedLabels.has(label));\n\
+          if (addLabels.length > 0) {\n  await client.rest.issues.addLabels({\n  \
+          \  owner,\n    repo,\n    issue_number: prNumber,\n    labels: addLabels\n\
+          \  });\n}\n\nconst removeLabels = (plan.remove_labels || []).filter(label\
+          \ => allowedLabels.has(label));\nfor (const label of removeLabels) {\n \
+          \ await client.rest.issues.removeLabel({\n    owner,\n    repo,\n    issue_number:\
+          \ prNumber,\n    name: label\n  }).catch(error => {\n    if (error.status\
+          \ !== 404) throw error;\n  });\n}\n\nconst allowedTeams = new Set([process.env.ALLOWED_TEAM\
+          \ || \"egm-maintainers\"].filter(Boolean));\nconst teamReviewers = (plan.team_reviewers\
+          \ || []).filter(team => allowedTeams.has(team));\nif (teamReviewers.length\
+          \ > 0) {\n  try {\n    await client.rest.pulls.requestReviewers({\n    \
+          \  owner,\n      repo,\n      pull_number: prNumber,\n      team_reviewers:\
+          \ teamReviewers\n    });\n  } catch (error) {\n    core.warning(\n     \
+          \ `Could not request team reviewers (${teamReviewers.join(\", \")}): ${error.message}.\
+          \ ` +\n      \"Configure or rotate secrets.EGM_TRIAGE_BOT_TOKEN with Pull\
+          \ requests: Read/Write to enable team review delegation.\"\n    );\n  }\n\
+          }\n"
